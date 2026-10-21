@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# DFIR Triage & Rootkit Hunter — Forensics Suite Edition v4
-# ==============================================================================
+# ============================================================================== 
+# DFIR Triage & Rootkit Hunter — Advanced Forensics Suite v5
+# ============================================================================== 
 # Purpose:
-#   Collect a high-value, evidence-first snapshot of a potentially compromised
-#   Linux host while preserving chain-of-custody and auditable investigative
-#   records. This is written for authorized DFIR, system administration, and
-#   red-team security review workflows.
+#   Build a high-value, evidence-first Linux forensic snapshot suitable for
+#   incident response, red-team review, and system-level threat hunting.
 #
 # Security model:
-#   - Transparent execution: no anti-forensic hiding or randomized names.
-#   - Evidentiary logging: every critical action is timestamped and archived.
-#   - Verifiable integrity: SHA-256 of scanner binaries, log file, and package.
-#   - Graceful fallback: trusted external tools are preferred when available.
-# ==============================================================================
+#   - Transparent, attributable execution.
+#   - Prefer trusted binaries from external media when available.
+#   - Preserve chain-of-custody and verifiable integrity.
+#   - Collect evidence without randomization or stealth behavior.
+# ============================================================================== 
 
 set -Eeuo pipefail
 umask 077
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="4.0.0"
+VERSION="5.0.0"
 
 DRY_RUN=0
 NO_INSTALL=0
@@ -132,6 +130,27 @@ copy_artifact() {
   fi
 }
 
+capture_process_artifacts() {
+  local pid="$1"
+  local proc_dir="/proc/$pid"
+  local out_dir="$ARTIFACT_DIR/processes/$pid"
+
+  [ -d "$proc_dir" ] || return 0
+  mkdir -p "$out_dir"
+
+  if [ -r "$proc_dir/status" ]; then cp -a "$proc_dir/status" "$out_dir/status" 2>/dev/null || true; fi
+  if [ -r "$proc_dir/cmdline" ]; then cp -a "$proc_dir/cmdline" "$out_dir/cmdline" 2>/dev/null || true; fi
+  if [ -r "$proc_dir/environ" ]; then cp -a "$proc_dir/environ" "$out_dir/environ" 2>/dev/null || true; fi
+  if [ -r "$proc_dir/mountinfo" ]; then cp -a "$proc_dir/mountinfo" "$out_dir/mountinfo" 2>/dev/null || true; fi
+  if [ -r "$proc_dir/maps" ]; then cp -a "$proc_dir/maps" "$out_dir/maps" 2>/dev/null || true; fi
+  if [ -r "$proc_dir/exe" ]; then
+    cp -a "$proc_dir/exe" "$out_dir/exe" 2>/dev/null || true
+  fi
+  if [ -r "$proc_dir/fd" ]; then
+    cp -a "$proc_dir/fd" "$out_dir/fd" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
   local rc=$?
   if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
@@ -161,6 +180,7 @@ PACKAGE_HASH_FILE="$PACKAGE_FILE.sha256"
 : > "$LOG_FILE"
 : > "$SUMMARY_FILE"
 mkdir -p "$ARTIFACT_DIR"
+mkdir -p "$ARTIFACT_DIR/processes"
 chattr +a "$LOG_FILE" 2>/dev/null || log "[!] Warning: chattr +a unsupported on this filesystem; log is not append-only protected."
 
 log "[*] DFIR Triage & Rootkit Hunter v${VERSION}"
@@ -178,11 +198,11 @@ append_summary "Workspace: $WORKSPACE"
 append_summary "============================"
 
 # -----------------------------------------------------------------------------
-# 0. Baseline host data
+# 0. Baseline system data
 # -----------------------------------------------------------------------------
 log "[*] PHASE 0: Host Baseline"
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would capture uname, OS details, uptime, mounts, and account data."
+  log "[DRY-RUN] Would capture uname, OS, uptime, mounts, and user context."
 else
   log "[+] Kernel and OS"
   uname -a 2>&1 | tee -a "$LOG_FILE" || true
@@ -195,7 +215,7 @@ else
   mount 2>&1 | tee -a "$LOG_FILE" || true
   if have_cmd lsblk; then lsblk -f 2>&1 | tee -a "$LOG_FILE" || true; fi
 
-  log "[+] User and privilege context"
+  log "[+] Users and privilege context"
   id 2>&1 | tee -a "$LOG_FILE" || true
   who -a 2>&1 | tee -a "$LOG_FILE" || true
   [ -f /etc/passwd ] && awk -F: '{print $1":"$3":"$4":"$6":"$7}' /etc/passwd 2>/dev/null | tee -a "$LOG_FILE" || true
@@ -203,29 +223,34 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 1. Runtime anomaly analysis
+# 1. Process-level forensics
 # -----------------------------------------------------------------------------
-log "[*] PHASE 1: Runtime Anomaly Analysis"
+log "[*] PHASE 1: Process-Level Forensics"
 
-log "[+] Scanning for deleted or unlinked process execution paths..."
+log "[+] Capturing process metadata and suspicious process state..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect /proc/*/exe for deleted entries."
+  log "[DRY-RUN] Would dump /proc process metadata, cmdline, environ, maps, stat, status, and executables."
 else
   for proc in /proc/[0-9]*; do
-    [ -r "$proc/exe" ] || continue
-    exe_target="$(readlink "$proc/exe" 2>/dev/null || true)"
-    if [ -n "$exe_target" ] && [[ "$exe_target" == *" (deleted)"* ]]; then
-      printf '%s %s\n' "${proc#/proc/}" "$exe_target" | tee -a "$LOG_FILE"
-    fi
+    [ -d "$proc" ] || continue
+    pid="${proc#/proc/}"
+    capture_process_artifacts "$pid"
   done
 
-  log "[+] Full process list with arguments"
-  ps -eo pid,ppid,uid,comm,args --forest 2>/dev/null | tee -a "$LOG_FILE" || true
+  log "[+] Full process table"
+  ps -eo pid,ppid,uid,comm,args,etimes --forest 2>/dev/null | tee -a "$LOG_FILE" || true
+
+  log "[+] Open files and network listeners"
+  if have_cmd lsof; then
+    lsof -nP 2>/dev/null | head -n 500 | tee -a "$LOG_FILE" || true
+  else
+    log "[!] lsof not installed; skipping open-file inventory."
+  fi
 fi
 
-log "[+] Hidden process cross-check: /proc vs ps..."
+log "[+] Hidden process and process tree analysis..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would compare kernel-visible PIDs against userland process listings."
+  log "[DRY-RUN] Would compare /proc and ps, and inspect suspicious process ancestry."
 else
   KERNEL_PIDS="$(find /proc -maxdepth 1 -mindepth 1 -type d -regex '/proc/[0-9]+' 2>/dev/null | sed 's|/proc/||' | sort -n || true)"
   USERLAND_PIDS="$(ps -eo pid= 2>/dev/null | awk '{print $1}' | sort -n || true)"
@@ -234,18 +259,38 @@ else
   else
     HIDDEN_PIDS=""
   fi
-
   if [ -n "$HIDDEN_PIDS" ]; then
     log "[!] ALERT: PIDs visible in /proc but missing from ps: $HIDDEN_PIDS"
     append_summary "ALERT: Hidden process indicator detected: $HIDDEN_PIDS"
   else
     log "[+] No discrepancy between /proc and ps."
   fi
+
+  log "[+] Process ancestry summary"
+  ps -eo pid,ppid,uid,comm,args --forest 2>/dev/null | tee -a "$LOG_FILE" || true
 fi
 
-log "[+] Hidden kernel module cross-check: /proc/modules vs lsmod..."
+# -----------------------------------------------------------------------------
+# 2. Runtime anomaly detection
+# -----------------------------------------------------------------------------
+log "[*] PHASE 2: Runtime Anomaly Analysis"
+
+log "[+] Scanning for deleted or unlinked binary execution paths..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would compare kernel module list to userland lsmod output."
+  log "[DRY-RUN] Would inspect /proc/*/exe for deleted entries."
+else
+  for proc in /proc/[0-9]*; do
+    [ -d "$proc" ] || continue
+    target="$(readlink "$proc/exe" 2>/dev/null || true)"
+    if [ -n "$target" ] && [[ "$target" == *" (deleted)"* ]]; then
+      printf '%s %s\n' "${proc#/proc/}" "$target" | tee -a "$LOG_FILE"
+    fi
+  done
+fi
+
+log "[+] Hidden kernel modules and preload poisoning checks..."
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "[DRY-RUN] Would compare /proc/modules with lsmod and inspect preload configuration."
 else
   PROC_MODS="$(awk '{print $1}' /proc/modules 2>/dev/null | sort || true)"
   if have_cmd lsmod; then
@@ -258,19 +303,13 @@ else
   else
     HIDDEN_MODS=""
   fi
-
   if [ -n "$HIDDEN_MODS" ]; then
     log "[!] ALERT: Modules visible in /proc/modules but hidden from lsmod: $HIDDEN_MODS"
     append_summary "ALERT: Hidden kernel module indicator detected: $HIDDEN_MODS"
   else
     log "[+] No discrepancy between /proc/modules and lsmod."
   fi
-fi
 
-log "[+] Checking LD_PRELOAD / ld.so.preload / library poisoning..."
-if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect shell rc files and preload configuration."
-else
   for candidate in /etc/profile /etc/profile.d /etc/environment /root/.bashrc /root/.bash_profile /home/*/.bashrc /home/*/.bash_profile; do
     [ -e "$candidate" ] || continue
     grep -RIn "LD_PRELOAD\|LD_LIBRARY_PATH\|PRELOAD" "$candidate" 2>/dev/null | tee -a "$LOG_FILE" || true
@@ -279,39 +318,17 @@ else
     log "[!] ALERT: /etc/ld.so.preload exists; contents:"
     cat /etc/ld.so.preload 2>/dev/null | tee -a "$LOG_FILE" || true
     append_summary "ALERT: /etc/ld.so.preload exists."
-  else
-    log "[+] No /etc/ld.so.preload file detected."
-  fi
-fi
-
-log "[+] Checking sockets and listening network services..."
-if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would list sockets and routes."
-else
-  if have_cmd ss; then
-    ss -tulpn 2>/dev/null | tee -a "$LOG_FILE" || true
-  elif have_cmd netstat; then
-    netstat -tulpn 2>/dev/null | tee -a "$LOG_FILE" || true
-  else
-    log "[!] No socket-listing tool found in PATH."
-  fi
-  if have_cmd ip; then
-    ip addr show 2>/dev/null | tee -a "$LOG_FILE" || true
-    ip route show 2>/dev/null | tee -a "$LOG_FILE" || true
-  fi
-  if [ -f /proc/net/tcp ] || [ -f /proc/net/tcp6 ]; then
-    cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | tee -a "$LOG_FILE" || true
   fi
 fi
 
 # -----------------------------------------------------------------------------
-# 2. Persistence and startup artifact audit
+# 3. Persistence and artifact audit
 # -----------------------------------------------------------------------------
-log "[*] PHASE 2: Persistence Artifact Audit"
+log "[*] PHASE 3: Persistence Artifact Audit"
 
-log "[+] SSH persistence and configuration checks..."
+log "[+] SSH persistence checks..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect authorized_keys and sshd_config files."
+  log "[DRY-RUN] Would inspect SSH key files and config."
 else
   while IFS= read -r candidate; do
     [ -n "$candidate" ] || continue
@@ -320,9 +337,9 @@ else
   done < <(find "$SCAN_ROOT" -xdev -type f \( -name 'authorized_keys' -o -name 'known_hosts' -o -name 'sshd_config' -o -name 'config' \) 2>/dev/null)
 fi
 
-log "[+] Cron, systemd, and rc.d persistence checks..."
+log "[+] Cron, systemd, and startup persistence checks..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect cron and systemd directories for recent modifications."
+  log "[DRY-RUN] Would inspect cron/systemd/startup dirs for recent files."
 else
   for dir in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron /var/spool/cron/crontabs /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /etc/init.d /etc/rc.d; do
     [ -e "$dir" ] || continue
@@ -332,44 +349,27 @@ else
     log "[+] /etc/rc.local contents:"
     cat /etc/rc.local 2>/dev/null | tee -a "$LOG_FILE" || true
   fi
-fi
-
-log "[+] Startup and auto-run location checks..."
-if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect profile.d, autostart directories, and rc scripts."
-else
-  for dir in /etc/profile.d /etc/xdg/autostart /root/.config/autostart /home/*/.config/autostart /etc/rc*.d /etc/init.d; do
+  for dir in /etc/profile.d /etc/xdg/autostart /root/.config/autostart /home/*/.config/autostart /etc/rc*.d; do
     [ -e "$dir" ] || continue
     find "$dir" -maxdepth 2 -type f 2>/dev/null | tee -a "$LOG_FILE" || true
   done
 fi
 
-log "[+] Shell startup file review for persistence or code injection..."
-if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect shell startup files."
-else
-  for candidate in /etc/profile /etc/bash.bashrc /etc/profile.d/* /root/.bashrc /root/.bash_profile /root/.profile /home/*/.bashrc /home/*/.bash_profile /home/*/.profile; do
-    [ -f "$candidate" ] || continue
-    log "[*] $candidate"
-    sed -n '1,220p' "$candidate" 2>/dev/null | tee -a "$LOG_FILE" || true
-  done
-fi
-
 # -----------------------------------------------------------------------------
-# 3. Suspicious artifacts and fileless indicators
+# 4. Suspicious file and directory hunting
 # -----------------------------------------------------------------------------
-log "[*] PHASE 3: Suspicious File & Artifact Search"
+log "[*] PHASE 4: Suspicious File & Directory Hunt"
 
-log "[+] Recent executable artifacts in ephemeral and user spaces..."
+log "[+] Recent executable artifacts and scripts in ephemeral and user spaces..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would search temp directories and writable service locations for recent scripts and binaries."
+  log "[DRY-RUN] Would search temp, service, and user directories for suspicious recent scripts and binaries."
 else
   find /tmp /dev/shm /var/tmp /opt /srv /home /var/www /usr/local/bin /usr/local/sbin -xdev -type f \( -perm -u+x -o -iname '*.sh' -o -iname '*.pl' -o -iname '*.py' -o -iname '*.php' -o -iname '*.bin' \) -mtime -7 -ls 2>/dev/null | tee -a "$LOG_FILE" || true
 fi
 
-log "[+] Finding writable executables in common persistence directories..."
+log "[+] Writable executables in core directories..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would locate writable executable files."
+  log "[DRY-RUN] Would detect writable executable files in writable service locations."
 else
   for dir in /tmp /var/tmp /dev/shm /opt /srv /home /var/www /usr/local/bin /usr/local/sbin; do
     [ -d "$dir" ] || continue
@@ -377,17 +377,17 @@ else
   done
 fi
 
-log "[+] Searching for suspicious names and hidden directories..."
+log "[+] Hidden or suspicious names..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would scan the filesystem for hidden or suspicious file names."
+  log "[DRY-RUN] Would scan the filesystem for hidden or suspicious names."
 else
   find "$SCAN_ROOT" -xdev \( -name '.*' -o -name '*tmp*' -o -name '*bak*' -o -name '*evil*' -o -name '*.so' \) 2>/dev/null | head -n 500 | tee -a "$LOG_FILE" || true
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Evidence collection
+# 5. Collector / artifact capture
 # -----------------------------------------------------------------------------
-log "[*] PHASE 4: Evidence Collection"
+log "[*] PHASE 5: Artifact Capture"
 for artifact in \
   /etc/hosts \
   /etc/resolv.conf \
@@ -414,9 +414,9 @@ for artifact in \
 done
 
 # -----------------------------------------------------------------------------
-# 5. Hashes and scanner selection
+# 6. Scanner selection and integrity
 # -----------------------------------------------------------------------------
-log "[*] PHASE 5: Scanner Selection & Hash Integrity"
+log "[*] PHASE 6: Trusted Scanner Selection"
 CLAM_BINARY=""
 RK_BINARY=""
 CHK_BINARY=""
@@ -429,10 +429,10 @@ if [ -x "$TRUSTED_DIR/clamscan" ] && [ -x "$TRUSTED_DIR/rkhunter" ] && [ -x "$TR
 else
   log "[!] No complete trusted scanner set found at $TRUSTED_DIR."
   if [ "$NO_INSTALL" -eq 1 ]; then
-    log "[!] --no-install set; installation is skipped."
+    log "[!] --no-install set; scanner installation is skipped."
   else
     if have_cmd apt-get; then
-      log "[+] Attempting fallback installation via apt-get."
+      log "[+] Attempting fallback install via apt-get."
       DEBIAN_FRONTEND=noninteractive apt-get update -yq >/dev/null 2>&1 || warn "apt-get update failed."
       DEBIAN_FRONTEND=noninteractive apt-get install -yq clamav rkhunter chkrootkit >/dev/null 2>&1 || warn "apt-get install failed."
       if have_cmd clamscan; then CLAM_BINARY="$(command -v clamscan)"; fi
@@ -461,7 +461,7 @@ done
 if [ "$DRY_RUN" -eq 1 ]; then
   log "[DRY-RUN] Would run: chkrootkit -q"
   log "[DRY-RUN] Would run: rkhunter --check --skip-keypress --report-warnings-only"
-  log "[DRY-RUN] Would run: clamscan --infected --recursive --max-filesize=50M on common directories."
+  log "[DRY-RUN] Would run: clamscan --infected --recursive --max-filesize=50M /tmp /dev/shm /var/tmp /home /var/www /srv /opt"
 else
   if [ -n "$CHK_BINARY" ] && [ -x "$CHK_BINARY" ]; then
     log "[+] Running chkrootkit (real name, no obfuscation)..."
@@ -486,9 +486,9 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 6. Summary & finalize
+# 7. Summary and packaging
 # -----------------------------------------------------------------------------
-log "[*] PHASE 6: Summary & Finalization"
+log "[*] PHASE 7: Summary & Finalization"
 append_summary "============================"
 append_summary "Findings summary"
 append_summary "- Scanner binaries used:"
@@ -512,7 +512,7 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
   log "[DRY-RUN] Would create final evidence archive: $PACKAGE_FILE"
   log "[DRY-RUN] Would hash archive and write $PACKAGE_HASH_FILE"
-  log "[+] Summary file: $SUMMARY_FILE"
+  log "[+] Summary report: $SUMMARY_FILE"
   log "[+] Evidence manifest: $MANIFEST_FILE"
   log "[+] Dry-run complete. No live evidence archive was produced."
   exit 0
