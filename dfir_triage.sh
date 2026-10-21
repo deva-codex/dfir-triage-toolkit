@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DFIR Triage & Rootkit Hunter — Enterprise-Grade, Evidence-First Edition
+# DFIR Triage & Rootkit Hunter — Forensics Suite Edition
 # ==============================================================================
 # Purpose:
-#   Capture a defensible, high-value snapshot of a potentially compromised Linux
-#   host while preserving chain-of-custody and forensic integrity.
+#   Collect a high-value, evidence-first snapshot for a potentially compromised
+#   Linux host while preserving chain-of-custody and making findings auditable.
 #
-# Design goals:
-#   - Transparent, verifiable, attributable execution.
-#   - Prefer trusted, external binaries when present.
-#   - Record evidence and metadata in a format suitable for later review.
-#   - Fail safely without hiding the fact that the tool ran.
-#   - Keep the investigation robust even in partially compromised environments.
-#
-# Usage:
-#   sudo ./dfir_triage.sh [--trusted-dir /mnt/ir-tools] [--scan-root /]
-#                         [--workspace-root /tmp] [--dry-run] [--no-install]
+# Features:
+#   - Transparent forensic workflow with explicit logging
+#   - Hidden process / module detection
+#   - LD_PRELOAD, cron, systemd, startup, SSH persistence checks
+#   - Fileless artifact detection and writable executable review
+#   - Optional trusted scanner selection from /mnt/ir-tools
+#   - Final evidence packaging with SHA-256 integrity manifest
+#   - Investigator summary report for triage handoff
 # ==============================================================================
 
 set -Eeuo pipefail
 umask 077
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="3.0.0"
+VERSION="3.1.0"
 
 DRY_RUN=0
 NO_INSTALL=0
@@ -30,15 +28,6 @@ TRUSTED_DIR="/mnt/ir-tools"
 SCAN_ROOT="/"
 WORKSPACE_ROOT="${TMPDIR:-/tmp}"
 LOG_FILE_OVERRIDE=""
-EXTRA_SCAN_DIRS=(
-  "/tmp"
-  "/dev/shm"
-  "/var/tmp"
-  "/home"
-  "/var/www"
-  "/srv"
-  "/opt"
-)
 
 usage() {
   cat <<EOF
@@ -99,9 +88,13 @@ done
 
 if [ "$EUID" -ne 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   echo "[-] This script must be run as root in live mode." >&2
-  echo "    Use --dry-run for safe validation without executing live host checks." >&2
+  echo "    Use --dry-run for safe validation without changing the host." >&2
   exit 1
 fi
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
 
 log() {
   printf '%s | %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOG_FILE"
@@ -118,8 +111,26 @@ record_hash() {
   sha256sum "$file_path" | tee -a "$LOG_FILE" >> "$MANIFEST_FILE"
 }
 
-have_cmd() {
-  command -v "$1" >/dev/null 2>&1
+add_summary() {
+  printf '%s\n' "$*" >> "$SUMMARY_FILE"
+}
+
+copy_artifact() {
+  local label="$1"
+  local src="$2"
+  local dst_dir="$3"
+
+  [ -n "$src" ] || return 0
+  if [ -e "$src" ]; then
+    mkdir -p "$dst_dir"
+    local b="$(basename "$src")"
+    if [ -d "$src" ]; then
+      cp -a "$src" "$dst_dir/" 2>/dev/null || warn "Unable to copy directory $src"
+    else
+      cp -a "$src" "$dst_dir/$b" 2>/dev/null || warn "Unable to copy file $src"
+    fi
+    log "[*] Captured $label: $src"
+  fi
 }
 
 cleanup() {
@@ -134,9 +145,8 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$WORKSPACE_ROOT" || { echo "[-] Failed to create workspace root: $WORKSPACE_ROOT" >&2; exit 1; }
-
 WORKSPACE="$(mktemp -d "${WORKSPACE_ROOT%/}/.triage-XXXXXXXX")" || {
-  echo "[-] Failed to create evidence workspace under $WORKSPACE_ROOT" >&2
+  echo "[-] Failed to create evidence workspace" >&2
   exit 1
 }
 
@@ -144,10 +154,15 @@ HOSTNAME_SAFE="$(hostname 2>/dev/null || echo "unknown-host")"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="${LOG_FILE_OVERRIDE:-$WORKSPACE/audit_${TIMESTAMP}.log}"
 MANIFEST_FILE="$WORKSPACE/manifest_${TIMESTAMP}.sha256"
+SUMMARY_FILE="$WORKSPACE/summary_${TIMESTAMP}.txt"
+ARTIFACT_DIR="$WORKSPACE/artifacts"
 PACKAGE_FILE="$WORKSPACE.tar.gz"
 PACKAGE_HASH_FILE="$PACKAGE_FILE.sha256"
 
 : > "$LOG_FILE"
+: > "$SUMMARY_FILE"
+mkdir -p "$ARTIFACT_DIR"
+
 chattr +a "$LOG_FILE" 2>/dev/null || log "[!] Warning: chattr +a unsupported on this filesystem; log is not append-only protected."
 
 log "[*] DFIR Triage & Rootkit Hunter v${VERSION}"
@@ -157,71 +172,54 @@ log "[*] Scan root: $SCAN_ROOT"
 log "[*] Trusted binary directory: $TRUSTED_DIR"
 log "[*] Chain-of-custody: investigator + hostname + UTC timestamp recorded above."
 
-collect_snapshot() {
-  local label="$1"
-  local target="$2"
-  [ -n "$target" ] || return 0
-  if [ -d "$target" ] || [ -f "$target" ]; then
-    log "[*] Collecting $label: $target"
-    if [ "$DRY_RUN" -eq 0 ]; then
-      cp -a "$target" "$WORKSPACE/" 2>/dev/null || warn "Unable to copy $label: $target"
-    else
-      log "[DRY-RUN] Would copy $label: $target"
-    fi
-  fi
-}
+add_summary "DFIR Triage Summary"
+add_summary "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+add_summary "Host: $HOSTNAME_SAFE"
+add_summary "Investigator: $(logname 2>/dev/null || whoami)"
+add_summary "Workspace: $WORKSPACE"
+add_summary "============================"
 
 # -----------------------------------------------------------------------------
-# 1. Baseline host intelligence
+# Baseline host intelligence
 # -----------------------------------------------------------------------------
-log "[*] PHASE 0: Host Baseline & Environment"
+log "[*] PHASE 0: Host Baseline"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would record host baseline information: uname, os-release, uptime, mount, users, and time sync."
+  log "[DRY-RUN] Would collect uname, os-release, uptime, mounts, users, and system details."
 else
-  for cmd in uname cat /etc/os-release /proc/version uptime df -h mount ps -eo pid,ppid,uid,comm,cmd --forest who id lastlog; do
-    if have_cmd "${cmd%% *}" || [ "$cmd" = "cat" ] || [ "$cmd" = "uname" ] || [ "$cmd" = "id" ] || [ "$cmd" = "who" ] || [ "$cmd" = "lastlog" ] || [ "$cmd" = "ps" ] || [ "$cmd" = "df" ] || [ "$cmd" = "mount" ]; then
-      :
-    fi
-  done
-
-  log "[+] Kernel and OS"
+  log "[+] Kernel and OS information"
   uname -a 2>&1 | tee -a "$LOG_FILE" || true
   [ -f /etc/os-release ] && cat /etc/os-release 2>/dev/null | tee -a "$LOG_FILE" || true
   [ -f /proc/version ] && cat /proc/version 2>/dev/null | tee -a "$LOG_FILE" || true
 
-  log "[+] System uptime, disk, and mounts"
+  log "[+] Uptime, filesystems, and mounts"
   uptime 2>&1 | tee -a "$LOG_FILE" || true
   df -h 2>&1 | tee -a "$LOG_FILE" || true
   mount 2>&1 | tee -a "$LOG_FILE" || true
   if have_cmd lsblk; then lsblk -f 2>&1 | tee -a "$LOG_FILE" || true; fi
 
-  log "[+] Users and privilege context"
+  log "[+] User and privilege context"
   id 2>&1 | tee -a "$LOG_FILE" || true
   who -a 2>&1 | tee -a "$LOG_FILE" || true
   [ -f /etc/passwd ] && awk -F: '{print $1":"$3":"$4":"$6":"$7}' /etc/passwd 2>/dev/null | tee -a "$LOG_FILE" || true
-  [ -f /etc/shadow ] && ls -l /etc/shadow 2>/dev/null | tee -a "$LOG_FILE" || true
-  if have_cmd sudo; then sudo -l 2>&1 | tee -a "$LOG_FILE" || true; fi
+  if have_cmd lastlog; then lastlog 2>/dev/null | tee -a "$LOG_FILE" || true; fi
 fi
 
 # -----------------------------------------------------------------------------
-# 2. Runtime anomaly detection
+# Runtime anomaly detection
 # -----------------------------------------------------------------------------
 log "[*] PHASE 1: Runtime Anomaly Analysis"
 
-log "[+] Scanning for processes executing from deleted, unlinked, or suspicious binaries..."
+log "[+] Scanning for processes executing from deleted or unlinked binaries..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect /proc/*/exe and /proc/*/cmdline for deleted or suspicious execution links."
+  log "[DRY-RUN] Would inspect /proc/*/exe for deleted entries."
 else
-  find /proc -maxdepth 1 -mindepth 1 -type d -regex '/proc/[0-9]+' -exec sh -c 'for d do p="${d#/proc/}"; target=$(readlink "$d/exe" 2>/dev/null || true); [ -n "$target" ] || continue; case "$target" in *" (deleted)"*) printf "%s %s\n" "$p" "$target";; esac; done' sh {} + 2>/dev/null | tee -a "$LOG_FILE" || true
-
-  log "[+] Detailed process list (including command lines and ancestors)"
-  ps -eo pid,ppid,uid,comm,args --forest 2>/dev/null | tee -a "$LOG_FILE" || true
+  find /proc -maxdepth 1 -mindepth 1 -type d -regex '/proc/[0-9]+' -exec sh -c 'for d do target=$(readlink "$d/exe" 2>/dev/null || true); [ -n "$target" ] || continue; case "$target" in *" (deleted)") printf "%s %s\n" "${d#/proc/}" "$target";; esac; done' sh {} + 2>/dev/null | tee -a "$LOG_FILE" || true
 fi
 
-log "[+] Cross-referencing /proc, ps, and /proc/*/status for hidden process indicators..."
+log "[+] Cross-referencing /proc against ps for hidden processes..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would compare kernel-visible PIDs against userland process listings and status data."
+  log "[DRY-RUN] Would compare kernel-visible PIDs and userland process lists."
 else
   KERNEL_PIDS="$(find /proc -maxdepth 1 -mindepth 1 -type d -regex '/proc/[0-9]+' 2>/dev/null | sed 's|/proc/||' | sort -n || true)"
   USERLAND_PIDS="$(ps -eo pid= 2>/dev/null | awk '{print $1}' | sort -n || true)"
@@ -230,44 +228,43 @@ else
   else
     HIDDEN_PIDS=""
   fi
+
   if [ -n "$HIDDEN_PIDS" ]; then
     log "[!] ALERT: PIDs visible in /proc but missing from ps: $HIDDEN_PIDS"
+    add_summary "ALERT: Hidden process indicator detected: $HIDDEN_PIDS"
   else
     log "[+] No discrepancy between /proc and ps."
+    add_summary "No hidden process discrepancy between /proc and ps."
   fi
-
-  log "[+] Process status summary"
-  for p in /proc/[0-9]*; do
-    [ -r "$p/status" ] || continue
-    grep -E 'Name:|State:|PPid:|Uid:|Gid:|VmSize:|Threads:' "$p/status" 2>/dev/null | head -n 10 | tee -a "$LOG_FILE" || true
-  done
 fi
 
-log "[+] Cross-referencing /proc/modules against lsmod for hidden kernel modules..."
+log "[+] Cross-referencing /proc/modules against lsmod..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would compare Linux module lists provided by kernel and userspace."
+  log "[DRY-RUN] Would compare /proc/modules and lsmod outputs."
 else
+  PROC_MODS="$(awk '{print $1}' /proc/modules 2>/dev/null | sort || true)"
   if have_cmd lsmod; then
     LSMOD_MODS="$(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | sort || true)"
   else
     LSMOD_MODS=""
   fi
-  PROC_MODS="$(awk '{print $1}' /proc/modules 2>/dev/null | sort || true)"
   if [ -n "$PROC_MODS" ] && [ -n "$LSMOD_MODS" ]; then
     HIDDEN_MODS="$(comm -23 <(printf '%s\n' "$PROC_MODS") <(printf '%s\n' "$LSMOD_MODS") || true)"
   else
     HIDDEN_MODS=""
   fi
   if [ -n "$HIDDEN_MODS" ]; then
-    log "[!] ALERT: Modules visible in /proc/modules but hidden from lsmod: $HIDDEN_MODS"
+    log "[!] ALERT: Hidden kernel modules detected: $HIDDEN_MODS"
+    add_summary "ALERT: Hidden kernel module indicator detected: $HIDDEN_MODS"
   else
     log "[+] No discrepancy between /proc/modules and lsmod."
+    add_summary "No hidden module discrepancy between /proc/modules and lsmod."
   fi
 fi
 
-log "[+] Checking for LD_PRELOAD and preload poisoning..."
+log "[+] Checking for LD_PRELOAD / ld.so.preload poisoning..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect /etc/profile, /etc/profile.d, /etc/environment, shell rc files, and /etc/ld.so.preload."
+  log "[DRY-RUN] Would inspect shell rc files and /etc/ld.so.preload."
 else
   for candidate in /etc/profile /etc/profile.d /etc/environment /root/.bashrc /root/.bash_profile /home/*/.bashrc /home/*/.bash_profile; do
     [ -e "$candidate" ] || continue
@@ -276,6 +273,7 @@ else
   if [ -f /etc/ld.so.preload ]; then
     log "[!] ALERT: /etc/ld.so.preload exists. Contents:"
     cat /etc/ld.so.preload 2>/dev/null | tee -a "$LOG_FILE" || true
+    add_summary "ALERT: /etc/ld.so.preload exists."
   else
     log "[+] No /etc/ld.so.preload file detected."
   fi
@@ -283,7 +281,7 @@ fi
 
 log "[+] Checking listening sockets and network metadata..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would enumerate listening sockets, routes, netstat data, and open ports."
+  log "[DRY-RUN] Would list listening sockets and routing details."
 else
   if have_cmd ss; then
     ss -tulpn 2>/dev/null | tee -a "$LOG_FILE" || true
@@ -292,36 +290,37 @@ else
   else
     log "[!] No socket-listing tool found in PATH."
   fi
+
   if have_cmd ip; then
     ip addr show 2>/dev/null | tee -a "$LOG_FILE" || true
     ip route show 2>/dev/null | tee -a "$LOG_FILE" || true
   fi
-  if have_cmd route; then route -n 2>/dev/null | tee -a "$LOG_FILE" || true; fi
   if [ -f /proc/net/tcp ] || [ -f /proc/net/tcp6 ]; then
     cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | tee -a "$LOG_FILE" || true
   fi
 fi
 
 # -----------------------------------------------------------------------------
-# 3. Persistence mechanism audit
+# Persistence mechanism audit
 # -----------------------------------------------------------------------------
 log "[*] PHASE 2: Persistence Artifact Audit"
 
-log "[+] Auditing SSH authorized_keys and known SSH config vectors..."
+log "[+] Auditing SSH persistence and configuration files..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would search for authorized_keys, known_hosts, sshd_config, and likely persistence vectors."
+  log "[DRY-RUN] Would inspect authorized_keys, known_hosts, sshd_config, and SSH config files."
 else
-  find "$SCAN_ROOT" -xdev -type f \( -name 'authorized_keys' -o -name 'known_hosts' -o -name 'sshd_config' -o -name 'config' \) 2>/dev/null | while IFS= read -r entry; do
-    log "[*] Investigating $entry"
-    grep -HnE 'ssh-rsa|ssh-ed25519|ecdsa-sha2|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|AuthorizedKeysFile|Match ' "$entry" 2>/dev/null | tee -a "$LOG_FILE" || true
-  done
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    log "[*] $path"
+    grep -HnE 'ssh-rsa|ssh-ed25519|ecdsa-sha2|PubkeyAuthentication|PasswordAuthentication|PermitRootLogin|AuthorizedKeysFile|Match ' "$path" 2>/dev/null | tee -a "$LOG_FILE" || true
+  done < <(find "$SCAN_ROOT" -xdev -type f \( -name 'authorized_keys' -o -name 'known_hosts' -o -name 'sshd_config' -o -name 'config' \) 2>/dev/null)
 fi
 
-log "[+] Auditing cron and scheduled task persistence..."
+log "[+] Checking cron, systemd, and rc scripts modified recently..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect cron directories, crontabs, systemd units, init scripts, and rc scripts for recent modifications."
+  log "[DRY-RUN] Would inspect cron and systemd directories for recent modifications."
 else
-  for dir in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron /var/spool/cron/crontabs /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /etc/init.d /etc/rc.local /etc/rc.d; do
+  for dir in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron /var/spool/cron/crontabs /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /etc/init.d /etc/rc.d; do
     [ -e "$dir" ] || continue
     find "$dir" -xdev -type f -mtime -7 -ls 2>/dev/null | tee -a "$LOG_FILE" || true
   done
@@ -331,9 +330,9 @@ else
   fi
 fi
 
-log "[+] Auditing startup and autostart directories..."
+log "[+] Auditing startup and auto-run directories..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect ~/.config/autostart, /etc/profile.d, /etc/xdg/autostart, and /etc/rc*.d."
+  log "[DRY-RUN] Would inspect /etc/profile.d, ~/.config/autostart, /etc/xdg/autostart, and rc.d directories."
 else
   for dir in /etc/profile.d /etc/xdg/autostart /root/.config/autostart /home/*/.config/autostart /etc/rc*.d /etc/init.d; do
     [ -e "$dir" ] || continue
@@ -341,53 +340,82 @@ else
   done
 fi
 
-log "[+] Checking shell profiles and startup scripts for malicious command injection..."
+log "[+] Auditing shell profile persistence and injection points..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would inspect shell startup files and common persistence locations."
+  log "[DRY-RUN] Would review shell startup files /etc/profile and ~/.bashrc family."
 else
   for candidate in /etc/profile /etc/bash.bashrc /etc/profile.d/* /root/.bashrc /root/.bash_profile /root/.profile /home/*/.bashrc /home/*/.bash_profile /home/*/.profile; do
     [ -f "$candidate" ] || continue
     log "[*] $candidate"
-    sed -n '1,200p' "$candidate" 2>/dev/null | tee -a "$LOG_FILE" || true
+    sed -n '1,220p' "$candidate" 2>/dev/null | tee -a "$LOG_FILE" || true
   done
 fi
 
-log "[+] Auditing suspicious user and system binaries in writable locations..."
+# -----------------------------------------------------------------------------
+# Suspicious file / artifact search
+# -----------------------------------------------------------------------------
+log "[*] PHASE 3: File & Artifact Search"
+
+log "[+] Searching for suspicious recent executables and scripts..."
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would search writable directories for executable files that were modified recently."
+  log "[DRY-RUN] Would examine temp, service, app, and home directories for recent executable artifacts."
 else
-  for dir in /tmp /var/tmp /dev/shm /opt /srv /home /var/www /usr/local/bin /usr/local/sbin /tmp/.*/; do
+  find /tmp /dev/shm /var/tmp /opt /srv /home /var/www /usr/local/bin /usr/local/sbin -xdev -type f \( -perm -u+x -o -iname '*.sh' -o -iname '*.pl' -o -iname '*.py' -o -iname '*.php' -o -iname '*.bin' \) -mtime -7 -ls 2>/dev/null | tee -a "$LOG_FILE" || true
+fi
+
+log "[+] Looking for hidden directories and suspicious naming conventions..."
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "[DRY-RUN] Would scan the filesystem for hidden or suspicious file names."
+else
+  find "$SCAN_ROOT" -xdev \( -name '.*' -o -name '*tmp*' -o -name '*bak*' -o -name '*evil*' -o -name '*.so' \) 2>/dev/null | head -n 400 | tee -a "$LOG_FILE" || true
+fi
+
+log "[+] Reviewing writable executable binaries and scripts..."
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "[DRY-RUN] Would locate writable executables in common directories."
+else
+  for dir in /tmp /var/tmp /dev/shm /opt /srv /home /var/www /usr/local/bin /usr/local/sbin; do
     [ -d "$dir" ] || continue
-    find "$dir" -xdev -type f -perm /022 -o -type f -perm /002 2>/dev/null | head -n 200 | tee -a "$LOG_FILE" || true
+    find "$dir" -xdev -type f \( -perm -o+w -o -perm -g+w \) -perm /111 2>/dev/null | tee -a "$LOG_FILE" || true
   done
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Fileless / suspicious artifact detection
+# Capture forensic copies of key files
 # -----------------------------------------------------------------------------
-log "[*] PHASE 3: Suspicious File & Memory Artifact Search"
+log "[*] PHASE 4: Evidence Collection"
 
-log "[+] Looking for recently modified binaries and scripts in common persistence locations..."
-if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would search /tmp, /dev/shm, /var/tmp, /opt, /srv, /home, and /var/www for recent executable artifacts."
-else
-  find /tmp /dev/shm /var/tmp /opt /srv /home /var/www -xdev -type f \( -iname '*.sh' -o -iname '*.pl' -o -iname '*.py' -o -iname '*.php' -o -iname '*.bin' -o -perm -u+x \) -mtime -7 -ls 2>/dev/null | tee -a "$LOG_FILE" || true
-fi
-
-log "[+] Scanning for suspicious names and hidden directories..."
-if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would scan root file system for hidden directories and suspicious names."
-else
-  find "$SCAN_ROOT" -xdev \( -name '.*' -o -name '.*.*' -o -name '*tmp*' -o -name '*bak*' -o -name '*evil*' -o -name '*.so' \) 2>/dev/null | head -n 300 | tee -a "$LOG_FILE" || true
-fi
+for artifact in \
+  /etc/hosts \
+  /etc/resolv.conf \
+  /etc/sudoers \
+  /etc/sudoers.d \
+  /etc/cron.d \
+  /etc/cron.daily \
+  /etc/cron.hourly \
+  /etc/cron.weekly \
+  /etc/cron.monthly \
+  /etc/systemd/system \
+  /etc/profile.d \
+  /etc/init.d \
+  /etc/rc.local \
+  /etc/ssh/sshd_config \
+  /etc/ssh/ssh_config \
+  /etc/passwd \
+  /etc/shadow; do
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "[DRY-RUN] Would capture forensic artifact: $artifact"
+  else
+    copy_artifact "$(basename "$artifact" 2>/dev/null || echo "$artifact")" "$artifact" "$ARTIFACT_DIR"
+  fi
+done
 
 # -----------------------------------------------------------------------------
-# 5. Trusted binary selection and scanner execution
+# Scanner selection and execution
 # -----------------------------------------------------------------------------
-log "[*] PHASE 4: Signature-Based Scanning"
-log "[!] A ring-0 compromised host cannot fully trust PATH-resolved scanner binaries."
-log "    This script prefers known-good tools from $TRUSTED_DIR when present."
-log "    It will fall back to package-manager installation only if allowed."
+log "[*] PHASE 5: Signature-Based Scanning"
+log "[!] Host package managers and PATH-resolved binaries are lower assurance in a potentially compromised environment."
+log "    This script prefers known-good tools from $TRUSTED_DIR when available."
 
 CLAM_BINARY=""
 RK_BINARY=""
@@ -399,9 +427,9 @@ if [ -x "$TRUSTED_DIR/clamscan" ] && [ -x "$TRUSTED_DIR/rkhunter" ] && [ -x "$TR
   CHK_BINARY="$TRUSTED_DIR/chkrootkit"
   log "[+] Using externally supplied trusted binaries from $TRUSTED_DIR."
 else
-  log "[!] No complete set of trusted binaries found at $TRUSTED_DIR."
+  log "[!] No complete trusted scanner set detected at $TRUSTED_DIR."
   if [ "$NO_INSTALL" -eq 1 ]; then
-    log "[!] --no-install is set; installation is skipped."
+    log "[!] --no-install set; scanner installation is skipped."
   else
     if have_cmd apt-get; then
       log "[+] Attempting fallback installation via apt-get."
@@ -425,15 +453,15 @@ else
   fi
 fi
 
-log "[+] Recording SHA-256 of the exact scanner binaries used:"
+log "[+] Recording SHA-256 of scanner binaries used:"
 for b in "$RK_BINARY" "$CHK_BINARY" "$CLAM_BINARY"; do
   [ -n "$b" ] && [ -x "$b" ] && record_hash "$b"
 done
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would run: chkrootkit -q"
-  log "[DRY-RUN] Would run: rkhunter --check --skip-keypress --report-warnings-only"
-  log "[DRY-RUN] Would run: clamscan --infected --recursive --max-filesize=50M /tmp /dev/shm /var/tmp /home /var/www /srv /opt"
+  log "[DRY-RUN] Would run chkrootkit -q"
+  log "[DRY-RUN] Would run rkhunter --check --skip-keypress --report-warnings-only"
+  log "[DRY-RUN] Would scan common directories with clamscan --infected --recursive --max-filesize=50M"
 else
   if [ -n "$CHK_BINARY" ] && [ -x "$CHK_BINARY" ]; then
     log "[+] Running chkrootkit (real name, no obfuscation)..."
@@ -450,7 +478,7 @@ else
   fi
 
   if [ -n "$CLAM_BINARY" ] && [ -x "$CLAM_BINARY" ]; then
-    log "[+] Running ClamAV against common persistence and user-space directories..."
+    log "[+] Running ClamAV against common living-off-the-land directories..."
     "$CLAM_BINARY" --infected --recursive --max-filesize=50M /tmp /dev/shm /var/tmp /home /var/www /srv /opt >> "$LOG_FILE" 2>&1 || warn "ClamAV returned a non-zero exit code."
   else
     warn "clamscan not available; skipping."
@@ -458,29 +486,24 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 6. Capture critical forensic artifacts
+# Summary report generation
 # -----------------------------------------------------------------------------
-log "[*] PHASE 5: Evidence Collection"
-
-collect_snapshot "hosts file" "/etc/hosts"
-collect_snapshot "resolv.conf" "/etc/resolv.conf"
-collect_snapshot "sudoers" "/etc/sudoers"
-collect_snapshot "sudoers.d" "/etc/sudoers.d"
-collect_snapshot "cron hourly" "/etc/cron.hourly"
-collect_snapshot "cron daily" "/etc/cron.daily"
-collect_snapshot "cron weekly" "/etc/cron.weekly"
-collect_snapshot "cron monthly" "/etc/cron.monthly"
-collect_snapshot "systemd unit dir" "/etc/systemd/system"
-collect_snapshot "init.d" "/etc/init.d"
-collect_snapshot "profile.d" "/etc/profile.d"
-collect_snapshot "rc.local" "/etc/rc.local"
-
-if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would gather forensic copies of high-value persistence and config artifacts."
-fi
+log "[*] PHASE 6: Summary Report"
+add_summary "============================"
+add_summary "Findings summary"
+add_summary "- Scanner binaries used:"
+for b in "$RK_BINARY" "$CHK_BINARY" "$CLAM_BINARY"; do
+  if [ -n "$b" ] && [ -x "$b" ]; then
+    add_summary "  * $b"
+  fi
+done
+add_summary "- Log file: $LOG_FILE"
+add_summary "- Manifest: $MANIFEST_FILE"
+add_summary "- Artifacts directory: $ARTIFACT_DIR"
+add_summary "=== End of report ==="
 
 # -----------------------------------------------------------------------------
-# 7. Final packaging and chain-of-custody integrity
+# Final integrity packaging
 # -----------------------------------------------------------------------------
 log "[*] SCANS COMPLETE."
 if [ -f "$LOG_FILE" ]; then
@@ -491,25 +514,29 @@ if [ -f "$LOG_FILE" ]; then
   sha256sum "$LOG_FILE" >> "$MANIFEST_FILE"
 fi
 
+if [ -f "$SUMMARY_FILE" ]; then
+  sha256sum "$SUMMARY_FILE" >> "$MANIFEST_FILE"
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "[DRY-RUN] Would create archive: $PACKAGE_FILE"
+  log "[DRY-RUN] Would create final archive: $PACKAGE_FILE"
   log "[DRY-RUN] Would hash archive and write $PACKAGE_HASH_FILE"
-  log "[+] Evidence manifest path: $MANIFEST_FILE"
-  log "[+] Log file path: $LOG_FILE"
-  log "[+] Dry run complete. No live evidence artifact was packaged."
+  log "[+] Summary file: $SUMMARY_FILE"
+  log "[+] Evidence manifest: $MANIFEST_FILE"
+  log "[+] Dry-run complete. No live evidence archive was produced."
   exit 0
 fi
 
 if ! tar -czf "$PACKAGE_FILE" -C "$(dirname "$WORKSPACE")" "$(basename "$WORKSPACE")"; then
-  log "[!] Failed to create final evidence archive: $PACKAGE_FILE"
+  log "[!] Failed to create final evidence archive."
   exit 1
 fi
-
 sha256sum "$PACKAGE_FILE" > "$PACKAGE_HASH_FILE"
 
 log "[+] Evidence package: $PACKAGE_FILE"
 log "[+] Package hash: $(cat "$PACKAGE_HASH_FILE")"
 log "[+] Binary/log manifest: $MANIFEST_FILE"
-log "[-] Transfer the tarball and the .sha256 file together and verify the hash on the receiving end before treating it as evidence."
+log "[+] Summary report: $SUMMARY_FILE"
+log "[-] Transfer the tarball and .sha256 together and verify hash on the receiving end before treating the archive as evidence."
 
 exit 0
